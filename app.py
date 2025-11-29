@@ -23,7 +23,7 @@ client = MongoClient(MONGO_URI)
 db = client.get_database("arogyasparsh") 
 requests_collection = db.requests
 
-# --- HELPER FOR ML ---
+# --- HELPER: GENERATE PREDICTIONS ---
 def generate_predictions():
     data = list(requests_collection.find({"status": "Delivered"}))
     if not data: return []
@@ -66,7 +66,7 @@ def predict_demand():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- ✅ SMART AI CHATBOT ---
+# --- ✅ SMART AI CHATBOT (DYNAMIC) ---
 @app.route('/ai-chat', methods=['POST'])
 def ai_chat():
     try:
@@ -74,23 +74,23 @@ def ai_chat():
         query = data.get('query', '').lower()
         context = data.get('context', {}) 
 
-        response = "I'm not sure how to help with that. Try asking about 'stock', 'predictions', or 'status'."
+        response = "I'm not sure how to help with that. Try asking about 'stock', 'predictions', or 'status of Wagholi'."
 
-        # 1. Check Stock
+        # 1. Check Stock (Dynamic from Context)
         if 'stock' in query or 'inventory' in query:
             inv = context.get('inventory', [])
             low_stock = [item['name'] for item in inv if item['stock'] < 20]
             if low_stock:
-                response = f"⚠️ Low Stock Alert: The following items are below safety levels: {', '.join(low_stock)}. Consider restocking immediately."
+                response = f"⚠️ Low Stock Alert: {', '.join(low_stock)} are running low. Please restock."
             else:
-                response = "✅ Inventory Status: All medicines are well-stocked above safety levels."
+                response = "✅ Inventory Status: All medicines are well-stocked."
 
-        # 2. ✅ SMART TRACKING (Specific PHC Detection)
+        # 2. ✅ SMART TRACKING (Filters by PHC Name)
         elif 'status' in query or 'where' in query or 'track' in query or 'drone' in query:
-            # Fetch live missions from DB
-            active_orders = list(requests_collection.find({"status": {"$in": ["Dispatched", "In-Flight"]}}))
+            # Get ALL active missions from DB
+            active_orders = list(requests_collection.find({"status": {"$in": ["Dispatched", "In-Flight", "Delivered"]}}))
             
-            # Check if user mentioned a specific PHC
+            # Extract PHC Name from User Query (e.g., "Track Wagholi")
             target_phc = None
             phc_list = ["wagholi", "chamorshi", "gadhchiroli", "panera", "belgaon", "dhutergatta", "gatta", "gaurkheda", "murmadi"]
             
@@ -100,28 +100,26 @@ def ai_chat():
                     break
             
             if target_phc:
-                # Find mission for THIS specific PHC
-                specific_mission = next((r for r in active_orders if target_phc in r['phc'].lower()), None)
+                # Find latest mission for THIS specific PHC
+                # Sort by time to get the newest one
+                specific_mission = next((r for r in reversed(active_orders) if target_phc in r['phc'].lower()), None)
                 
                 if specific_mission:
-                    response = f"🚁 Mission Update: Drone to {specific_mission['phc']} is currently '{specific_mission['status']}'. It is carrying: {specific_mission['item']}."
+                    status_emoji = "✅" if specific_mission['status'] == "Delivered" else "🚁"
+                    response = f"{status_emoji} Update for {specific_mission['phc']}: Latest order is '{specific_mission['status']}' carrying {specific_mission['item']}."
                 else:
-                    response = f"ℹ️ No active drone flights found for {target_phc.title()} PHC at the moment."
+                    response = f"ℹ️ No recent drone activity found for {target_phc.title()} PHC."
             else:
-                # General Summary (If no PHC mentioned)
-                if active_orders:
-                    count = len(active_orders)
-                    latest = active_orders[0]
-                    response = f"🚁 Fleet Status: {count} drone(s) are currently in flight. The latest mission is enroute to {latest['phc']}."
-                else:
-                    response = "🛑 Fleet Status: All drones are currently docked. No active missions."
+                # General Summary
+                in_flight_count = len([r for r in active_orders if r['status'] == 'In-Flight'])
+                response = f"🚁 Fleet Overview: {in_flight_count} drones are currently in the air. Ask me to 'Track Wagholi' for specifics."
 
-        # 3. Predict Demand (Dynamic)
+        # 3. Predict Demand (Dynamic by PHC)
         elif 'predict' in query or 'future' in query or 'forecast' in query:
              try:
                  preds = generate_predictions()
                  if not preds:
-                     response = "📉 Not enough historical data yet."
+                     response = "📉 Not enough data for predictions yet."
                  else:
                      target_phc = None
                      for p in ["wagholi", "chamorshi", "gadhchiroli", "panera", "belgaon", "dhutergatta", "gatta", "gaurkheda", "murmadi"]:
@@ -132,18 +130,18 @@ def ai_chat():
                      if target_phc:
                          phc_preds = [p for p in preds if target_phc in p['phc'].lower()]
                          if phc_preds:
-                             top_pred = max(phc_preds, key=lambda x: x['predictedQty'])
-                             response = f"📊 AI Forecast for {top_pred['phc']}: Highest predicted demand is for '{top_pred['name']}' ({top_pred['predictedQty']} units). Trend: {top_pred['trend']}."
+                             top = max(phc_preds, key=lambda x: x['predictedQty'])
+                             response = f"📊 Forecast for {top['phc']}: Expect high demand for '{top['name']}' (~{top['predictedQty']} units) next week."
                          else:
-                             response = f"ℹ️ No significant demand spikes predicted for {target_phc}."
+                             response = f"ℹ️ No major demand spikes predicted for {target_phc}."
                      else:
-                         top_pred = max(preds, key=lambda x: x['predictedQty'])
-                         response = f"📊 System-Wide AI Forecast: Highest demand is at {top_pred['phc']} for '{top_pred['name']}' ({top_pred['predictedQty']} units)."
+                         top = max(preds, key=lambda x: x['predictedQty'])
+                         response = f"📊 System Forecast: Highest network demand is at {top['phc']} for '{top['name']}'."
              except Exception as e:
                  response = f"⚠️ AI Model Error: {str(e)}"
 
         elif 'hello' in query or 'hi' in query:
-             response = "Hello! I am the Arogya AI Copilot. Ask me to 'Track Panera drone' or 'Predict demand for Wagholi'."
+             response = "Hello! I am the Arogya AI. Ask me to 'Track Panera', 'Check Stock', or 'Predict demand'."
 
         return jsonify({"response": response})
 
