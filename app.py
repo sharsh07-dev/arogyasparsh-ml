@@ -85,7 +85,7 @@ def predict_demand():
 
 
 # ==========================================
-# 🤖 BOT 1: SWASTHYA-AI (PHC DASHBOARD)
+# 🤖 BOT 1: SWASTHYA-AI (ADMIN & GENERAL)
 # ==========================================
 @app.route('/swasthya-ai', methods=['POST'])
 def swasthya_ai():
@@ -103,7 +103,7 @@ def swasthya_ai():
                 found_phcs.append(fullname)
         found_phcs = list(set(found_phcs)) 
 
-        # A. COMPARISON (Kept Intact)
+        # A. COMPARISON
         if len(found_phcs) >= 2 or 'compare' in query:
             if len(found_phcs) < 2:
                 response["text"] = "Please name the two PHCs you want to compare (e.g., 'Compare Chamorshi and Panera')."
@@ -134,7 +134,7 @@ def swasthya_ai():
                     }
                 }
 
-        # B. TRACKING (Kept Intact)
+        # B. TRACKING
         elif 'track' in query or 'drone' in query or 'status' in query:
             active_orders = list(requests_collection.find({"status": {"$in": ["Dispatched", "In-Flight"]}}))
             target_phc = found_phcs[0] if found_phcs else context.get('userPHC')
@@ -152,7 +152,7 @@ def swasthya_ai():
             else:
                 response["text"] = "Which PHC should I track?"
 
-        # C. FORECASTING (Kept Intact)
+        # C. FORECASTING
         elif 'forecast' in query or 'predict' in query:
              preds = generate_predictions()
              target_phc = found_phcs[0] if found_phcs else context.get('userPHC', '')
@@ -215,14 +215,9 @@ def hospital_ai():
             
             # Fetch Real Data from MongoDB
             hosp_inv = hospital_inventory_collection.find_one()
+            items = hosp_inv.get('items', []) if hosp_inv else []
             
-            if not hosp_inv or 'items' not in hosp_inv:
-                return jsonify({"text": "⚠️ Database Error: No Hospital Inventory found.", "type": "error"})
-
-            items = hosp_inv['items']
             today = datetime.now().date()
-            
-            # LOGIC: Filter Expired Items
             expired_list = []
             low_stock_list = []
 
@@ -234,7 +229,7 @@ def hospital_ai():
                     
                     # Check Expiry
                     if item_expiry < today:
-                        expired_list.append([item['name'], item['batch'], item['expiry']])
+                        expired_list.append([item['name'], item.get('batch', 'N/A'), item['expiry']])
                     
                     # Check Low Stock (< 100)
                     if int(item['stock']) < 100:
@@ -292,6 +287,103 @@ def hospital_ai():
 
     except Exception as e:
         print(e)
+        return jsonify({"text": f"System Error: {str(e)}", "type": "error"}), 500
+
+
+# ==========================================
+# 🚑 BOT 3: PHC ASSISTANT (PHC DASHBOARD)
+# ==========================================
+@app.route('/phc-assistant', methods=['POST'])
+def phc_assistant():
+    try:
+        data = request.json
+        query = data.get('query', '').lower()
+        phc_id = data.get('context', {}).get('phc_id', 'Wagholi PHC')
+        is_voice = data.get('is_voice', False)
+        
+        response = {
+            "text": "",
+            "type": "text",
+            "stt": { "transcript": query if is_voice else None, "confidence": 0.98 },
+            "data": {},
+            "retrieved_at": datetime.now().isoformat()
+        }
+
+        # 1. INVENTORY QUERY
+        if 'expired' in query or 'expiry' in query or 'stock' in query:
+            phc_data = phc_inventory_collection.find_one({"phcName": phc_id})
+            
+            if not phc_data:
+                response["text"] = f"Error: Could not fetch inventory for {phc_id}."
+            else:
+                items = phc_data.get('items', [])
+                today = datetime.now().date()
+                
+                expired_list = []
+                low_stock_list = []
+
+                for item in items:
+                    try:
+                        exp_date = datetime.strptime(item.get('expiry', '2099-01-01'), "%Y-%m-%d").date()
+                        if exp_date < today: expired_list.append(item)
+                        if int(item.get('stock', 0)) < 20: low_stock_list.append(item)
+                    except: continue
+
+                if 'expired' in query:
+                    if expired_list:
+                        response["text"] = f"⚠️ Found **{len(expired_list)} expired items** in {phc_id} inventory."
+                        response["type"] = "table"
+                        response["data"] = {
+                            "title": "Expired Inventory",
+                            "headers": ["Item Name", "Batch", "Expiry"],
+                            "rows": [[i['name'], i.get('batch', '-'), i['expiry']] for i in expired_list]
+                        }
+                    else:
+                        response["text"] = "✅ No expired items found in database."
+                
+                elif 'stock' in query:
+                     if low_stock_list:
+                        response["text"] = f"⚠️ **Low Stock Alert**: {len(low_stock_list)} items are below reorder level."
+                        response["type"] = "table"
+                        response["data"] = {
+                            "title": "Low Stock List",
+                            "headers": ["Item Name", "Current Qty", "Reorder Level"],
+                            "rows": [[i['name'], i['stock'], "20"] for i in low_stock_list]
+                        }
+                     else:
+                        response["text"] = "✅ All stock levels are healthy."
+
+        # 2. RECENT ORDERS
+        elif 'recent' in query or 'orders' in query:
+            recent_orders = list(requests_collection.find({"phc": phc_id}).sort("createdAt", -1).limit(3))
+            
+            if recent_orders:
+                rows = []
+                for o in recent_orders:
+                    item_str = o.get('item', 'Unknown')
+                    status = o.get('status', 'Pending')
+                    date = o.get('createdAt').strftime("%d-%b %H:%M") if o.get('createdAt') else "N/A"
+                    rows.append([date, item_str, status])
+
+                response["text"] = f"Here are the **3 most recent orders** for {phc_id}."
+                response["type"] = "table"
+                response["data"] = {
+                    "title": "Recent Orders",
+                    "headers": ["Date", "Items", "Status"],
+                    "rows": rows
+                }
+            else:
+                response["text"] = "No recent order history found."
+
+        elif 'hello' in query or 'hi' in query:
+            response["text"] = f"Hello. I am **SwasthyaAI-PHC**. I am assigned to **{phc_id}**.\nI can check **Expired Items**, list **Low Stock**, or show **Recent Orders**."
+
+        else:
+            response["text"] = "I can only answer queries about Inventory, Expired Items, or Recent Orders."
+
+        return jsonify(response)
+
+    except Exception as e:
         return jsonify({"text": f"System Error: {str(e)}", "type": "error"}), 500
 
 if __name__ == '__main__':
