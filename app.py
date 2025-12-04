@@ -6,7 +6,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
 import os
 from dotenv import load_dotenv
-import datetime
+from datetime import datetime
 import numpy as np
 import re
 import time
@@ -25,7 +25,7 @@ client = MongoClient(MONGO_URI)
 db = client.get_database("arogyasparsh") 
 requests_collection = db.requests
 phc_inventory_collection = db.phcinventories
-hospital_inventory_collection = db.hospitalinventories # ✅ Hospital Stock
+hospital_inventory_collection = db.hospitalinventories 
 
 # GLOBAL MAP: Keywords -> Database Names
 PHC_KEYWORD_MAP = {
@@ -51,7 +51,7 @@ def generate_predictions():
     model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(X, y)
     future_predictions = []
-    next_week_day = datetime.datetime.now().timetuple().tm_yday + 7
+    next_week_day = datetime.now().timetuple().tm_yday + 7
     unique_items = df['item_name'].unique()
     unique_phcs = df['phc'].unique()
     for phc in unique_phcs:
@@ -84,7 +84,9 @@ def predict_demand():
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 
-# --- 🤖 1. SWASTHYA-AI (PHC DASHBOARD) ---
+# ==========================================
+# 🤖 BOT 1: SWASTHYA-AI (PHC DASHBOARD)
+# ==========================================
 @app.route('/swasthya-ai', methods=['POST'])
 def swasthya_ai():
     try:
@@ -99,9 +101,9 @@ def swasthya_ai():
         for key, fullname in PHC_KEYWORD_MAP.items():
             if key in query:
                 found_phcs.append(fullname)
-        found_phcs = list(set(found_phcs)) # Remove duplicates
+        found_phcs = list(set(found_phcs)) 
 
-        # A. COMPARISON
+        # A. COMPARISON (Kept Intact)
         if len(found_phcs) >= 2 or 'compare' in query:
             if len(found_phcs) < 2:
                 response["text"] = "Please name the two PHCs you want to compare (e.g., 'Compare Chamorshi and Panera')."
@@ -132,7 +134,7 @@ def swasthya_ai():
                     }
                 }
 
-        # B. TRACKING
+        # B. TRACKING (Kept Intact)
         elif 'track' in query or 'drone' in query or 'status' in query:
             active_orders = list(requests_collection.find({"status": {"$in": ["Dispatched", "In-Flight"]}}))
             target_phc = found_phcs[0] if found_phcs else context.get('userPHC')
@@ -150,7 +152,7 @@ def swasthya_ai():
             else:
                 response["text"] = "Which PHC should I track?"
 
-        # C. FORECASTING
+        # C. FORECASTING (Kept Intact)
         elif 'forecast' in query or 'predict' in query:
              preds = generate_predictions()
              target_phc = found_phcs[0] if found_phcs else context.get('userPHC', '')
@@ -171,18 +173,18 @@ def swasthya_ai():
              else:
                  response["text"] = f"Insufficient data to forecast for {target_phc}."
 
-        # D. GREETING
         elif 'hello' in query or 'hi' in query:
             response["text"] = "Hello! I am **SwasthyaAI**. Ask me to 'Compare PHCs', 'Track Drone', or 'Predict Demand'."
 
         return jsonify(response)
 
     except Exception as e:
-        print(e)
-        return jsonify({"text": "System Error. Please try again.", "type": "error"}), 500
+        return jsonify({"text": "System Error.", "type": "error"}), 500
 
 
-# --- 🏥 2. HOSPITAL SWASTHYA AI (HOSPITAL DASHBOARD) ---
+# ==========================================
+# 🏥 BOT 2: HOSPITAL SWASTHYA AI (OPS)
+# ==========================================
 @app.route('/hospital-ai', methods=['POST'])
 def hospital_ai():
     try:
@@ -192,7 +194,7 @@ def hospital_ai():
         response = {
             "text": "I am **SwasthyaAI (Hospital Ops)**. Ready to assist.",
             "type": "text",
-            "meta": {}
+            "data": {}
         }
 
         # 1. 🎙️ VOICE ORDER PROCESSING
@@ -208,39 +210,68 @@ def hospital_ai():
                 }
             }
 
-        # 2. 📦 INVENTORY AUDIT (Low/Expired)
-        elif 'inventory' in query or 'stock' in query or 'expiry' in query:
-            # Fetch real hospital stock
+        # 2. 📦 REAL INVENTORY AUDIT (Logic: Date Comparison)
+        elif 'inventory' in query or 'stock' in query or 'expiry' in query or 'expired' in query:
+            
+            # Fetch Real Data from MongoDB
             hosp_inv = hospital_inventory_collection.find_one()
-            items = hosp_inv.get('items', []) if hosp_inv else []
             
-            expired = [i for i in items if i.get('expiry') and i['expiry'] < datetime.datetime.now().strftime("%Y-%m-%d")]
-            low_stock = [i for i in items if i['stock'] < 100] 
+            if not hosp_inv or 'items' not in hosp_inv:
+                return jsonify({"text": "⚠️ Database Error: No Hospital Inventory found.", "type": "error"})
+
+            items = hosp_inv['items']
+            today = datetime.now().date()
             
-            if 'expired' in query:
-                target_list = expired
-                label = "EXPIRED ITEMS"
-                action = "Quarantine & Dispose"
-            else:
-                target_list = low_stock
-                label = "CRITICAL LOW STOCK"
-                action = "Reorder Immediately"
+            # LOGIC: Filter Expired Items
+            expired_list = []
+            low_stock_list = []
 
-            if target_list:
-                rows = [[i['name'], i['stock'], i.get('expiry', 'N/A')] for i in target_list]
-                response = {
-                    "text": f"⚠️ **Audit Report: {label}**\nFound {len(target_list)} items requiring attention.",
-                    "type": "table",
-                    "data": {
-                        "headers": ["Item Name", "Qty", "Expiry"],
-                        "rows": rows
-                    },
-                    "recommendation": action
-                }
-            else:
-                 response["text"] = "✅ Inventory Scan Complete. No critical issues found."
+            for item in items:
+                try:
+                    # Handle Date Parsing
+                    item_expiry_str = item.get('expiry', '2099-12-31')
+                    item_expiry = datetime.strptime(item_expiry_str, "%Y-%m-%d").date()
+                    
+                    # Check Expiry
+                    if item_expiry < today:
+                        expired_list.append([item['name'], item['batch'], item['expiry']])
+                    
+                    # Check Low Stock (< 100)
+                    if int(item['stock']) < 100:
+                        low_stock_list.append([item['name'], item['stock'], "Critical"])
+                except:
+                    continue 
 
-        # 3. 🏥 PHC TRACKING (Specific)
+            # GENERATE RESPONSE
+            if 'expired' in query or 'expiry' in query:
+                if len(expired_list) > 0:
+                    response = {
+                        "text": f"🚨 **CRITICAL ALERT: EXPIRED MEDICINES**\n\nI found **{len(expired_list)}** items in the warehouse that have passed their expiry date. Immediate removal required.",
+                        "type": "table",
+                        "data": {
+                            "headers": ["Medicine Name", "Batch ID", "Expired On"],
+                            "rows": expired_list
+                        },
+                        "recommendation": f"Dispose Batch {expired_list[0][1]}"
+                    }
+                else:
+                    response["text"] = "✅ **Audit Complete:** No expired medicines found in the active inventory."
+            
+            elif 'stock' in query:
+                 if len(low_stock_list) > 0:
+                    response = {
+                        "text": f"⚠️ **LOW STOCK WARNING**\n\nThe following items are below the safety threshold (100 units).",
+                        "type": "table",
+                        "data": {
+                            "headers": ["Item Name", "Current Qty", "Status"],
+                            "rows": low_stock_list
+                        },
+                        "recommendation": f"Reorder {low_stock_list[0][0]}"
+                    }
+                 else:
+                    response["text"] = "✅ **Stock Healthy:** All items are above critical levels."
+
+        # 3. PHC STATUS CHECK
         elif 'phc' in query or 'track' in query:
             target = next((name for key, name in PHC_KEYWORD_MAP.items() if key in query), "Unknown PHC")
             response = {
@@ -254,15 +285,14 @@ def hospital_ai():
                 }
             }
 
-        # 4. DEFAULT
         else:
-             response["text"] = "I can process **Voice Orders**, scan for **Expired Medicine**, or track **PHC Status**. What do you need?"
+             response["text"] = "I can process **Voice Orders**, scan for **Expired Medicine**, or track **PHC Status**. Tap the mic to speak."
 
         return jsonify(response)
 
     except Exception as e:
         print(e)
-        return jsonify({"text": "System Error.", "type": "error"}), 500
+        return jsonify({"text": f"System Error: {str(e)}", "type": "error"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5002))
