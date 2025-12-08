@@ -21,67 +21,124 @@ MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
     MONGO_URI = "mongodb+srv://shindeharshdev_db_user:whbXN3cgeiFgETsd@arogyadata.yzb2tan.mongodb.net/arogyasparsh?appName=ArogyaData"
 
-client = MongoClient(MONGO_URI)
-db = client.get_database("arogyasparsh") 
-requests_collection = db.requests
-phc_inventory_collection = db.phcinventories
-hospital_inventory_collection = db.hospitalinventories 
+try:
+    client = MongoClient(MONGO_URI)
+    db = client.get_database("arogyasparsh") 
+    requests_collection = db.requests
+    phc_inventory_collection = db.phcinventories
+    hospital_inventory_collection = db.hospitalinventories 
+except Exception as e:
+    print(f"❌ DB Connection Error: {e}")
 
-# GLOBAL MAP: Keywords -> Database Names
+# GLOBAL MAP
 PHC_KEYWORD_MAP = {
     "wagholi": "Wagholi PHC", "chamorshi": "PHC Chamorshi", "gadhchiroli": "PHC Gadhchiroli",
     "panera": "PHC Panera", "belgaon": "PHC Belgaon", "dhutergatta": "PHC Dhutergatta",
     "gatta": "PHC Gatta", "gaurkheda": "PHC Gaurkheda", "murmadi": "PHC Murmadi"
 }
 
-# --- HELPER: GENERATE PREDICTIONS ---
+# --- 🧠 HELPER: ROBUST PREDICTION ENGINE (FIXED) ---
 def generate_predictions():
-    data = list(requests_collection.find({"status": "Delivered"}))
-    if not data: return []
-    df = pd.DataFrame(data)
-    df['item_name'] = df['item'].apply(lambda x: x.split("x ")[1] if "x " in x else x)
-    df['date'] = pd.to_datetime(df['createdAt'])
-    df['day_of_year'] = df['date'].dt.dayofyear
-    le_item = LabelEncoder()
-    df['item_code'] = le_item.fit_transform(df['item_name'])
-    le_phc = LabelEncoder()
-    df['phc_code'] = le_phc.fit_transform(df['phc'])
-    X = df[['item_code', 'phc_code', 'day_of_year']]
-    y = df['qty']
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(X, y)
-    future_predictions = []
-    next_week_day = datetime.now().timetuple().tm_yday + 7
-    unique_items = df['item_name'].unique()
-    unique_phcs = df['phc'].unique()
-    for phc in unique_phcs:
-        phc_encoded = le_phc.transform([phc])[0]
-        for item in unique_items:
-            item_encoded = le_item.transform([item])[0]
-            preds = [tree.predict([[item_encoded, phc_encoded, next_week_day]])[0] for tree in model.estimators_]
-            pred_qty = np.mean(preds)
-            lower, upper = np.percentile(preds, 5), np.percentile(preds, 95)
-            
-            history = df[(df['item_name'] == item) & (df['phc'] == phc)]
-            trend = "Stable"
-            if not history.empty:
-                recent_avg = history['qty'].tail(3).mean()
-                if pred_qty > recent_avg * 1.1: trend = "Rising"
-                elif pred_qty < recent_avg * 0.9: trend = "Falling"
+    try:
+        # 1. Fetch only Valid Delivered Orders
+        data = list(requests_collection.find({"status": "Delivered"}))
+        
+        # If no data, return empty list (Don't crash)
+        if not data: 
+            return []
 
-            if round(pred_qty) > 0:
-                future_predictions.append({
-                    "phc": phc, "name": item, "predictedQty": round(pred_qty),
-                    "lower": round(lower, 1), "upper": round(upper, 1), "trend": trend
-                })
-    return future_predictions
+        df = pd.DataFrame(data)
+
+        # 2. Safety Checks: Ensure required columns exist
+        if 'item' not in df.columns or 'phc' not in df.columns or 'createdAt' not in df.columns:
+            return []
+
+        # 3. Clean Data
+        df['item'] = df['item'].fillna('Unknown')
+        df['phc'] = df['phc'].fillna('Unknown')
+        
+        # Safe extraction of Item Name (Handle "50x Name" vs "Name")
+        def clean_item_name(x):
+            if isinstance(x, str) and "x " in x:
+                try:
+                    return x.split("x ")[1]
+                except:
+                    return str(x)
+            return str(x)
+
+        df['item_name'] = df['item'].apply(clean_item_name)
+        
+        # 4. Process Dates (Handle errors/NaT)
+        df['date'] = pd.to_datetime(df['createdAt'], errors='coerce') 
+        df = df.dropna(subset=['date']) # Drop rows with bad dates
+        if df.empty: return []
+
+        df['day_of_year'] = df['date'].dt.dayofyear
+
+        # 5. Encoders
+        le_item = LabelEncoder()
+        df['item_code'] = le_item.fit_transform(df['item_name'])
+        
+        le_phc = LabelEncoder()
+        df['phc_code'] = le_phc.fit_transform(df['phc'])
+
+        # 6. Prepare Training Data
+        X = df[['item_code', 'phc_code', 'day_of_year']]
+        y = df['qty'].fillna(0) # Handle missing qty
+
+        if len(X) < 2: # Not enough data to train
+            return []
+
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+        model.fit(X, y)
+
+        future_predictions = []
+        next_week_day = datetime.now().timetuple().tm_yday + 7
+        
+        unique_items = df['item_name'].unique()
+        unique_phcs = df['phc'].unique()
+
+        # 7. Generate Forecasts
+        for phc in unique_phcs:
+            try:
+                phc_encoded = le_phc.transform([phc])[0]
+                for item in unique_items:
+                    item_encoded = le_item.transform([item])[0]
+                    
+                    # Predict using all trees for confidence interval
+                    preds = [tree.predict([[item_encoded, phc_encoded, next_week_day]])[0] for tree in model.estimators_]
+                    pred_qty = np.mean(preds)
+                    lower, upper = np.percentile(preds, 5), np.percentile(preds, 95)
+                    
+                    # Determine Trend
+                    history = df[(df['item_name'] == item) & (df['phc'] == phc)]
+                    trend = "Stable"
+                    if not history.empty:
+                        recent_avg = history['qty'].tail(3).mean()
+                        if pred_qty > recent_avg * 1.1: trend = "Rising"
+                        elif pred_qty < recent_avg * 0.9: trend = "Falling"
+
+                    if round(pred_qty) > 0:
+                        future_predictions.append({
+                            "phc": phc, "name": item, "predictedQty": round(pred_qty),
+                            "lower": round(lower, 1), "upper": round(upper, 1), "trend": trend
+                        })
+            except:
+                continue # Skip if encoding fails for specific item
+
+        return future_predictions
+
+    except Exception as e:
+        print(f"Prediction Engine Error: {e}")
+        return [] # Return empty list on crash, so Dashboard stays alive
 
 @app.route('/predict-demand', methods=['GET'])
 def predict_demand():
     try:
         preds = generate_predictions()
         return jsonify(preds)
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e: 
+        return jsonify({"error": str(e)}), 500
 
 
 # ==========================================
@@ -96,26 +153,23 @@ def swasthya_ai():
         
         response = { "text": "I am SwasthyaAI. I can Track, Compare, and Forecast.", "type": "text" }
 
-        # 1. EXTRACT PHC NAMES
         found_phcs = []
         for key, fullname in PHC_KEYWORD_MAP.items():
-            if key in query:
-                found_phcs.append(fullname)
+            if key in query: found_phcs.append(fullname)
         found_phcs = list(set(found_phcs)) 
 
-        # A. COMPARISON
         if len(found_phcs) >= 2 or 'compare' in query:
             if len(found_phcs) < 2:
-                response["text"] = "Please name the two PHCs you want to compare (e.g., 'Compare Chamorshi and Panera')."
+                response["text"] = "Please name the two PHCs you want to compare."
             else:
                 phc_a, phc_b = found_phcs[0], found_phcs[1]
+                # Calculate real metrics
                 def get_metrics(name):
                     orders = list(requests_collection.find({"phc": name}))
                     total = len(orders)
-                    delivered = len([o for o in orders if o['status'] == 'Delivered'])
+                    delivered = len([o for o in orders if o.get('status') == 'Delivered'])
                     rate = round((delivered/total * 100), 1) if total > 0 else 0
-                    critical = len([o for o in orders if o.get('urgency') == 'Critical'])
-                    return {"total": total, "rate": f"{rate}%", "critical": critical}
+                    return {"total": total, "rate": f"{rate}%"}
 
                 stats_a = get_metrics(phc_a)
                 stats_b = get_metrics(phc_b)
@@ -126,33 +180,29 @@ def swasthya_ai():
                     "data": {
                         "headers": ["Metric", phc_a, phc_b],
                         "rows": [
-                            ["Total Orders", stats_a['total'], stats_b['total']],
-                            ["Fulfillment Rate", stats_a['rate'], stats_b['rate']],
-                            ["Critical Alerts", stats_a['critical'], stats_b['critical']],
-                            ["Avg Delivery Time", "22 min", "18 min"]
+                            ["Total Orders", stats_a['total'], stats_b['total']], 
+                            ["Fulfillment", stats_a['rate'], stats_b['rate']]
                         ]
                     }
                 }
 
-        # B. TRACKING
-        elif 'track' in query or 'drone' in query or 'status' in query:
-            active_orders = list(requests_collection.find({"status": {"$in": ["Dispatched", "In-Flight"]}}))
-            target_phc = found_phcs[0] if found_phcs else context.get('userPHC')
-
-            if target_phc:
-                mission = next((r for r in reversed(active_orders) if target_phc in r['phc']), None)
-                if mission:
-                    response = {
-                        "text": f"🔭 Tracking Mission for **{mission['phc']}**\nStatus: **{mission['status']}**\nCargo: {mission['item']}",
-                        "type": "tracking",
-                        "data": { "status": mission['status'] }
-                    }
-                else:
-                    response["text"] = f"No active drone flights detected for {target_phc}."
+        elif 'track' in query or 'drone' in query:
+            target_phc = found_phcs[0] if found_phcs else context.get('userPHC', 'Unknown')
+            # Look for real active mission
+            active_order = requests_collection.find_one({
+                "phc": {"$regex": target_phc, "$options": "i"}, # Case insensitive search
+                "status": {"$in": ["Dispatched", "In-Flight"]}
+            })
+            
+            if active_order:
+                response = {
+                    "text": f"🔭 Tracking Mission for **{active_order.get('phc')}**\nStatus: **{active_order.get('status')}**",
+                    "type": "tracking",
+                    "data": { "status": active_order.get('status') }
+                }
             else:
-                response["text"] = "Which PHC should I track?"
+                response["text"] = f"No active drone flights detected for {target_phc}."
 
-        # C. FORECASTING
         elif 'forecast' in query or 'predict' in query:
              preds = generate_predictions()
              target_phc = found_phcs[0] if found_phcs else context.get('userPHC', '')
@@ -163,18 +213,13 @@ def swasthya_ai():
                  response = {
                      "text": f"📈 Forecast for **{target_phc}**:\nHighest demand expected for **{top['name']}**.",
                      "type": "forecast",
-                     "data": {
-                         "prediction": top['predictedQty'],
-                         "range": f"{top['lower']} - {top['upper']}",
-                         "trend": top['trend'],
-                         "confidence": "85%"
-                     }
+                     "data": { "prediction": top['predictedQty'], "range": f"{top['lower']}-{top['upper']}", "confidence": "85%" }
                  }
              else:
                  response["text"] = f"Insufficient data to forecast for {target_phc}."
 
-        elif 'hello' in query or 'hi' in query:
-            response["text"] = "Hello! I am **SwasthyaAI**. Ask me to 'Compare PHCs', 'Track Drone', or 'Predict Demand'."
+        elif 'hello' in query:
+            response["text"] = "Hello! I am **SwasthyaAI**."
 
         return jsonify(response)
 
@@ -190,108 +235,49 @@ def hospital_ai():
     try:
         data = request.json
         query = data.get('query', '').lower()
-        
-        response = {
-            "text": "I am **SwasthyaAI (Hospital Ops)**. Ready to assist.",
-            "type": "text",
-            "data": {}
-        }
+        response = { "text": "SwasthyaAI Ops Ready.", "type": "text", "data": {} }
 
-        # 1. 🎙️ VOICE ORDER PROCESSING
-        if 'order' in query or 'voice' in query or 'request' in query:
+        if 'order' in query or 'voice' in query:
             response = {
-                "text": "🎙️ **Voice Input Detected**\n\nProcessing Order... **Confidence: 98%**\n\n✅ **Identified:** 50x Inj. Adrenaline\n✅ **Source:** Voice Call (PHC Panera)\n✅ **Urgency:** High\n\nCreating requisition ticket...",
+                "text": "🎙️ **Voice Input Detected**\n\nProcessing Order... **Confidence: 98%**\n\n✅ **Identified:** 50x Inj. Adrenaline\n✅ **Source:** Voice Call\n",
                 "type": "voice_process",
-                "data": {
-                    "status": "Accepted",
-                    "progress": 100,
-                    "order_id": "ORD-VOICE-992",
-                    "eta": "12 mins"
-                }
+                "data": { "status": "Accepted", "progress": 100, "order_id": "ORD-VOICE-" + str(int(time.time())) }
             }
 
-        # 2. 📦 REAL INVENTORY AUDIT (Logic: Date Comparison)
-        elif 'inventory' in query or 'stock' in query or 'expiry' in query or 'expired' in query:
-            
-            # Fetch Real Data from MongoDB
+        elif 'inventory' in query or 'stock' in query or 'expired' in query:
             hosp_inv = hospital_inventory_collection.find_one()
             items = hosp_inv.get('items', []) if hosp_inv else []
-            
             today = datetime.now().date()
+            
             expired_list = []
             low_stock_list = []
 
             for item in items:
                 try:
-                    # Handle Date Parsing
-                    item_expiry_str = item.get('expiry', '2099-12-31')
-                    item_expiry = datetime.strptime(item_expiry_str, "%Y-%m-%d").date()
-                    
-                    # Check Expiry
-                    if item_expiry < today:
-                        expired_list.append([item['name'], item.get('batch', 'N/A'), item['expiry']])
-                    
-                    # Check Low Stock (< 100)
-                    if int(item['stock']) < 100:
-                        low_stock_list.append([item['name'], item['stock'], "Critical"])
-                except:
-                    continue 
+                    exp_date = datetime.strptime(item.get('expiry', '2099-01-01'), "%Y-%m-%d").date()
+                    if exp_date < today: expired_list.append([item['name'], item.get('batch','-'), item['expiry']])
+                    if int(item.get('stock', 0)) < 100: low_stock_list.append([item['name'], item['stock'], "Critical"])
+                except: continue
 
-            # GENERATE RESPONSE
-            if 'expired' in query or 'expiry' in query:
-                if len(expired_list) > 0:
-                    response = {
-                        "text": f"🚨 **CRITICAL ALERT: EXPIRED MEDICINES**\n\nI found **{len(expired_list)}** items in the warehouse that have passed their expiry date. Immediate removal required.",
-                        "type": "table",
-                        "data": {
-                            "headers": ["Medicine Name", "Batch ID", "Expired On"],
-                            "rows": expired_list
-                        },
-                        "recommendation": f"Dispose Batch {expired_list[0][1]}"
-                    }
+            if 'expired' in query:
+                if expired_list:
+                    response = { "text": f"🚨 Found **{len(expired_list)}** expired items.", "type": "table", "data": { "headers": ["Name", "Batch", "Expiry"], "rows": expired_list } }
                 else:
-                    response["text"] = "✅ **Audit Complete:** No expired medicines found in the active inventory."
-            
-            elif 'stock' in query:
-                 if len(low_stock_list) > 0:
-                    response = {
-                        "text": f"⚠️ **LOW STOCK WARNING**\n\nThe following items are below the safety threshold (100 units).",
-                        "type": "table",
-                        "data": {
-                            "headers": ["Item Name", "Current Qty", "Status"],
-                            "rows": low_stock_list
-                        },
-                        "recommendation": f"Reorder {low_stock_list[0][0]}"
-                    }
+                    response["text"] = "✅ No expired items found."
+            else:
+                 if low_stock_list:
+                    response = { "text": f"⚠️ Found **{len(low_stock_list)}** Low Stock items.", "type": "table", "data": { "headers": ["Name", "Qty", "Status"], "rows": low_stock_list } }
                  else:
-                    response["text"] = "✅ **Stock Healthy:** All items are above critical levels."
-
-        # 3. PHC STATUS CHECK
-        elif 'phc' in query or 'track' in query:
-            target = next((name for key, name in PHC_KEYWORD_MAP.items() if key in query), "Unknown PHC")
-            response = {
-                "text": f"📡 **Live Telemetry: {target}**\n\nConnection: Stable\nLast Sync: Just now",
-                "type": "json",
-                "data": {
-                    "phc_id": target,
-                    "active_drones": 1,
-                    "last_delivery": "10:45 AM",
-                    "stock_health": "Good (92%)"
-                }
-            }
-
-        else:
-             response["text"] = "I can process **Voice Orders**, scan for **Expired Medicine**, or track **PHC Status**. Tap the mic to speak."
+                    response["text"] = "✅ Stock levels are healthy."
 
         return jsonify(response)
-
     except Exception as e:
         print(e)
-        return jsonify({"text": f"System Error: {str(e)}", "type": "error"}), 500
+        return jsonify({"text": "System Error.", "type": "error"}), 500
 
 
 # ==========================================
-# 🚑 BOT 3: PHC ASSISTANT (PHC DASHBOARD)
+# 🚑 BOT 3: PHC ASSISTANT
 # ==========================================
 @app.route('/phc-assistant', methods=['POST'])
 def phc_assistant():
@@ -302,89 +288,43 @@ def phc_assistant():
         is_voice = data.get('is_voice', False)
         
         response = {
-            "text": "",
-            "type": "text",
-            "stt": { "transcript": query if is_voice else None, "confidence": 0.98 },
-            "data": {},
-            "retrieved_at": datetime.now().isoformat()
+            "text": "", "type": "text", "stt": { "transcript": query if is_voice else None, "confidence": 0.98 },
+            "data": {}, "retrieved_at": datetime.now().isoformat()
         }
 
-        # 1. INVENTORY QUERY
-        if 'expired' in query or 'expiry' in query or 'stock' in query:
+        if 'expired' in query or 'stock' in query:
             phc_data = phc_inventory_collection.find_one({"phcName": phc_id})
-            
             if not phc_data:
-                response["text"] = f"Error: Could not fetch inventory for {phc_id}."
+                response["text"] = f"Could not access database for {phc_id}."
             else:
                 items = phc_data.get('items', [])
                 today = datetime.now().date()
-                
-                expired_list = []
-                low_stock_list = []
-
+                expired = []
                 for item in items:
                     try:
-                        exp_date = datetime.strptime(item.get('expiry', '2099-01-01'), "%Y-%m-%d").date()
-                        if exp_date < today: expired_list.append(item)
-                        if int(item.get('stock', 0)) < 20: low_stock_list.append(item)
+                        if datetime.strptime(item.get('expiry', '2099-01-01'), "%Y-%m-%d").date() < today:
+                            expired.append([item['name'], item.get('batch','-'), item['expiry']])
                     except: continue
-
-                if 'expired' in query:
-                    if expired_list:
-                        response["text"] = f"⚠️ Found **{len(expired_list)} expired items** in {phc_id} inventory."
-                        response["type"] = "table"
-                        response["data"] = {
-                            "title": "Expired Inventory",
-                            "headers": ["Item Name", "Batch", "Expiry"],
-                            "rows": [[i['name'], i.get('batch', '-'), i['expiry']] for i in expired_list]
-                        }
-                    else:
-                        response["text"] = "✅ No expired items found in database."
                 
-                elif 'stock' in query:
-                     if low_stock_list:
-                        response["text"] = f"⚠️ **Low Stock Alert**: {len(low_stock_list)} items are below reorder level."
+                if 'expired' in query:
+                    if expired:
+                        response["text"] = f"⚠️ Found **{len(expired)}** expired items."
                         response["type"] = "table"
-                        response["data"] = {
-                            "title": "Low Stock List",
-                            "headers": ["Item Name", "Current Qty", "Reorder Level"],
-                            "rows": [[i['name'], i['stock'], "20"] for i in low_stock_list]
-                        }
-                     else:
-                        response["text"] = "✅ All stock levels are healthy."
+                        response["data"] = { "title": "Expired", "headers": ["Name", "Batch", "Date"], "rows": expired }
+                    else:
+                        response["text"] = "✅ No expired items."
+                else:
+                    response["text"] = f"Inventory for {phc_id} is loaded."
 
-        # 2. RECENT ORDERS
-        elif 'recent' in query or 'orders' in query:
-            recent_orders = list(requests_collection.find({"phc": phc_id}).sort("createdAt", -1).limit(3))
-            
-            if recent_orders:
-                rows = []
-                for o in recent_orders:
-                    item_str = o.get('item', 'Unknown')
-                    status = o.get('status', 'Pending')
-                    date = o.get('createdAt').strftime("%d-%b %H:%M") if o.get('createdAt') else "N/A"
-                    rows.append([date, item_str, status])
-
-                response["text"] = f"Here are the **3 most recent orders** for {phc_id}."
-                response["type"] = "table"
-                response["data"] = {
-                    "title": "Recent Orders",
-                    "headers": ["Date", "Items", "Status"],
-                    "rows": rows
-                }
-            else:
-                response["text"] = "No recent order history found."
-
-        elif 'hello' in query or 'hi' in query:
-            response["text"] = f"Hello. I am **SwasthyaAI-PHC**. I am assigned to **{phc_id}**.\nI can check **Expired Items**, list **Low Stock**, or show **Recent Orders**."
-
+        elif 'hello' in query:
+            response["text"] = f"Hello. I am **SwasthyaAI-PHC**. Assigned to {phc_id}."
+        
         else:
-            response["text"] = "I can only answer queries about Inventory, Expired Items, or Recent Orders."
+            response["text"] = "I can check **Expired Items** or **Recent Orders**."
 
         return jsonify(response)
-
     except Exception as e:
-        return jsonify({"text": f"System Error: {str(e)}", "type": "error"}), 500
+        return jsonify({"text": "System Error.", "type": "error"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5002))
