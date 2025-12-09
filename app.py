@@ -37,11 +37,11 @@ PHC_KEYWORD_MAP = {
     "gatta": "PHC Gatta", "gaurkheda": "PHC Gaurkheda", "murmadi": "PHC Murmadi"
 }
 
-# --- 🧠 REAL-TIME PREDICTION ENGINE (WITH FALLBACK) ---
+# --- 🧠 REAL-TIME PREDICTION ENGINE (STRICTLY DATA DRIVEN) ---
 def generate_predictions():
     try:
-        # 1. GET ALL ORDERS (Relaxed Status Check)
-        # We grab EVERYTHING to ensure we have data to show.
+        # 1. GET ALL REAL ORDERS
+        # Fetching everything ensures even a single 'Pending' order counts towards demand
         data = list(requests_collection.find({}))
         
         if not data: 
@@ -64,26 +64,24 @@ def generate_predictions():
             return str(x)
 
         df['item_name'] = df['item'].apply(clean_item_name)
+        # Force Quantity to Numeric
         df['qty'] = pd.to_numeric(df['qty'], errors='coerce').fillna(0)
         
-        # 4. Process Dates (Use Current Time if date is missing)
+        # 4. Feature Engineering
         df['createdAt'] = pd.to_datetime(df['createdAt'], errors='coerce').fillna(datetime.now())
         df['day_of_year'] = df['createdAt'].dt.dayofyear
         
-        # Encoders
         le_item = LabelEncoder()
         df['item_code'] = le_item.fit_transform(df['item_name'])
         
         le_phc = LabelEncoder()
         df['phc_code'] = le_phc.fit_transform(df['phc'])
 
-        # 5. Train Model (Hybrid Approach)
+        # 5. Hybrid Training (ML + Average)
         X = df[['item_code', 'phc_code', 'day_of_year']]
         y = df['qty']
 
-        # ✅ HYBRID LOGIC: 
-        # If we have < 5 orders, ML overfits or fails. Use Simple Average instead.
-        # If > 5 orders, use Random Forest for better accuracy.
+        # Only use ML if we have enough data points (>5), otherwise use Statistical Average
         use_ml = len(X) > 5
         model = None
         
@@ -100,34 +98,31 @@ def generate_predictions():
         # 6. Generate PER-PHC Predictions
         for phc in unique_phcs:
             try:
-                # Filter history for this specific PHC & Item combo first
+                # Filter specific PHC history
                 phc_subset = df[df['phc'] == phc]
-                
                 if phc_subset.empty: continue
 
-                # Get PHC Code safely
                 phc_encoded = le_phc.transform([phc])[0]
 
                 for item in unique_items:
-                    # History for this item at this PHC
+                    # Filter specific Item history at this PHC
                     item_history = phc_subset[phc_subset['item_name'] == item]
                     
                     if item_history.empty:
-                        continue # Skip items never ordered by this PHC
+                        continue 
 
                     pred_qty = 0
                     
                     if use_ml:
-                        # ML Prediction
+                        # Attempt ML Prediction
                         item_encoded = le_item.transform([item])[0]
                         pred_qty = model.predict([[item_encoded, phc_encoded, next_week_day]])[0]
                     else:
-                        # ✅ FALLBACK: Simple Average (Robust for Demo)
-                        # If you placed 10 orders of 50 units, this will predict 50.
+                        # FALLBACK: Simple Average (Ensures 1 order shows up!)
                         pred_qty = item_history['qty'].mean()
 
+                    # Only show if demand is significant
                     if pred_qty >= 1:
-                        # Trend Logic
                         recent_avg = item_history['qty'].tail(3).mean()
                         trend = "Stable"
                         if pred_qty > recent_avg * 1.05: trend = "Rising 📈"
@@ -139,10 +134,9 @@ def generate_predictions():
                             "predictedQty": int(round(pred_qty)),
                             "trend": trend
                         })
-            except Exception as inner_e:
-                continue
+            except: continue
 
-        # 7. Generate CHAMORSHI SUB-DISTRICT (Aggregation)
+        # 7. Generate CHAMORSHI SUB-DISTRICT Aggregation
         district_data = {}
         for p in future_predictions:
             if p['name'] not in district_data:
@@ -151,7 +145,7 @@ def generate_predictions():
         
         for item_name, total_qty in district_data.items():
             future_predictions.append({
-                "phc": "Chamorshi Sub-District",
+                "phc": "Chamorshi Sub-District",  # ✅ The Label You Requested
                 "name": item_name,
                 "predictedQty": total_qty,
                 "trend": "Aggregated"
@@ -160,7 +154,7 @@ def generate_predictions():
         return future_predictions
 
     except Exception as e:
-        print(f"AI Error: {e}")
+        print(f"AI Prediction Error: {e}")
         return []
 
 @app.route('/predict-demand', methods=['GET'])
@@ -173,7 +167,7 @@ def predict_demand():
 
 
 # ==========================================
-# 🤖 BOT 1: SWASTHYA-AI (GENERAL)
+# 🤖 BOT 1: SWASTHYA-AI (General/Comparison)
 # ==========================================
 @app.route('/swasthya-ai', methods=['POST'])
 def swasthya_ai():
@@ -191,7 +185,7 @@ def swasthya_ai():
 
         if len(found_phcs) >= 2 or 'compare' in query:
             if len(found_phcs) < 2:
-                response["text"] = "Please name the two PHCs you want to compare."
+                response["text"] = "Please name two PHCs (e.g. Compare Panera and Wagholi)."
             else:
                 phc_a, phc_b = found_phcs[0], found_phcs[1]
                 def get_metrics(name):
@@ -257,7 +251,7 @@ def swasthya_ai():
 
 
 # ==========================================
-# 🏥 BOT 2: HOSPITAL SWASTHYA AI (OPS)
+# 🏥 BOT 2: HOSPITAL SWASTHYA AI (Ops/Voice)
 # ==========================================
 @app.route('/hospital-ai', methods=['POST'])
 def hospital_ai():
