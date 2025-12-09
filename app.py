@@ -37,22 +37,23 @@ PHC_KEYWORD_MAP = {
     "gatta": "PHC Gatta", "gaurkheda": "PHC Gaurkheda", "murmadi": "PHC Murmadi"
 }
 
-# --- 🧠 REAL-TIME PREDICTION ENGINE ---
+# --- 🧠 REAL-TIME PREDICTION ENGINE (WITH FALLBACK) ---
 def generate_predictions():
     try:
-        # 1. GET REAL DATA (Status: ALL active demand)
-        data = list(requests_collection.find({
-            "status": {"$in": ["Pending", "Approved", "Dispatched", "In-Flight", "Delivered"]}
-        }))
+        # 1. GET ALL ORDERS (Relaxed Status Check)
+        # We grab EVERYTHING to ensure we have data to show.
+        data = list(requests_collection.find({}))
         
         if not data: 
             return []
 
         df = pd.DataFrame(data)
 
-        if 'item' not in df.columns or 'phc' not in df.columns or 'createdAt' not in df.columns:
+        # 2. Safety Checks
+        if 'item' not in df.columns or 'phc' not in df.columns:
             return []
 
+        # 3. Clean Data
         df['item'] = df['item'].fillna('Unknown')
         df['phc'] = df['phc'].fillna('Unknown')
         
@@ -65,25 +66,30 @@ def generate_predictions():
         df['item_name'] = df['item'].apply(clean_item_name)
         df['qty'] = pd.to_numeric(df['qty'], errors='coerce').fillna(0)
         
-        df['date'] = pd.to_datetime(df['createdAt'], errors='coerce')
-        df = df.dropna(subset=['date'])
-        if df.empty: return []
-
-        df['day_of_year'] = df['date'].dt.dayofyear
+        # 4. Process Dates (Use Current Time if date is missing)
+        df['createdAt'] = pd.to_datetime(df['createdAt'], errors='coerce').fillna(datetime.now())
+        df['day_of_year'] = df['createdAt'].dt.dayofyear
         
+        # Encoders
         le_item = LabelEncoder()
         df['item_code'] = le_item.fit_transform(df['item_name'])
         
         le_phc = LabelEncoder()
         df['phc_code'] = le_phc.fit_transform(df['phc'])
 
+        # 5. Train Model (Hybrid Approach)
         X = df[['item_code', 'phc_code', 'day_of_year']]
         y = df['qty']
 
-        if len(X) < 1: return []
-
-        model = RandomForestRegressor(n_estimators=50, random_state=42)
-        model.fit(X, y)
+        # ✅ HYBRID LOGIC: 
+        # If we have < 5 orders, ML overfits or fails. Use Simple Average instead.
+        # If > 5 orders, use Random Forest for better accuracy.
+        use_ml = len(X) > 5
+        model = None
+        
+        if use_ml:
+            model = RandomForestRegressor(n_estimators=50, random_state=42)
+            model.fit(X, y)
 
         future_predictions = []
         next_week_day = datetime.now().timetuple().tm_yday + 7
@@ -91,22 +97,41 @@ def generate_predictions():
         unique_items = df['item_name'].unique()
         unique_phcs = df['phc'].unique()
 
-        # Generate PER-PHC Predictions
+        # 6. Generate PER-PHC Predictions
         for phc in unique_phcs:
             try:
+                # Filter history for this specific PHC & Item combo first
+                phc_subset = df[df['phc'] == phc]
+                
+                if phc_subset.empty: continue
+
+                # Get PHC Code safely
                 phc_encoded = le_phc.transform([phc])[0]
+
                 for item in unique_items:
-                    item_encoded = le_item.transform([item])[0]
+                    # History for this item at this PHC
+                    item_history = phc_subset[phc_subset['item_name'] == item]
                     
-                    pred_qty = model.predict([[item_encoded, phc_encoded, next_week_day]])[0]
+                    if item_history.empty:
+                        continue # Skip items never ordered by this PHC
+
+                    pred_qty = 0
                     
+                    if use_ml:
+                        # ML Prediction
+                        item_encoded = le_item.transform([item])[0]
+                        pred_qty = model.predict([[item_encoded, phc_encoded, next_week_day]])[0]
+                    else:
+                        # ✅ FALLBACK: Simple Average (Robust for Demo)
+                        # If you placed 10 orders of 50 units, this will predict 50.
+                        pred_qty = item_history['qty'].mean()
+
                     if pred_qty >= 1:
-                        phc_history = df[(df['item_name'] == item) & (df['phc'] == phc)]
-                        recent_avg = phc_history['qty'].tail(3).mean() if not phc_history.empty else 0
-                        
+                        # Trend Logic
+                        recent_avg = item_history['qty'].tail(3).mean()
                         trend = "Stable"
-                        if pred_qty > recent_avg * 1.1: trend = "Rising 📈"
-                        elif pred_qty < recent_avg * 0.9: trend = "Falling 📉"
+                        if pred_qty > recent_avg * 1.05: trend = "Rising 📈"
+                        elif pred_qty < recent_avg * 0.95: trend = "Falling 📉"
 
                         future_predictions.append({
                             "phc": phc,
@@ -114,9 +139,10 @@ def generate_predictions():
                             "predictedQty": int(round(pred_qty)),
                             "trend": trend
                         })
-            except: continue
+            except Exception as inner_e:
+                continue
 
-        # Generate DISTRICT OVERALL (Aggregation)
+        # 7. Generate CHAMORSHI SUB-DISTRICT (Aggregation)
         district_data = {}
         for p in future_predictions:
             if p['name'] not in district_data:
@@ -125,7 +151,7 @@ def generate_predictions():
         
         for item_name, total_qty in district_data.items():
             future_predictions.append({
-                "phc": "District Overall",
+                "phc": "Chamorshi Sub-District",
                 "name": item_name,
                 "predictedQty": total_qty,
                 "trend": "Aggregated"
@@ -147,7 +173,7 @@ def predict_demand():
 
 
 # ==========================================
-# 🤖 BOT 1: SWASTHYA-AI (ADMIN & GENERAL)
+# 🤖 BOT 1: SWASTHYA-AI (GENERAL)
 # ==========================================
 @app.route('/swasthya-ai', methods=['POST'])
 def swasthya_ai():
@@ -326,6 +352,7 @@ def phc_assistant():
             response["text"] = "I can check **Expired Items** or **Recent Orders**."
 
         return jsonify(response)
+
     except Exception as e:
         return jsonify({"text": f"System Error: {str(e)}", "type": "error"}), 500
 
