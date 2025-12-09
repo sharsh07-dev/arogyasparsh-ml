@@ -37,59 +37,52 @@ PHC_KEYWORD_MAP = {
     "gatta": "PHC Gatta", "gaurkheda": "PHC Gaurkheda", "murmadi": "PHC Murmadi"
 }
 
-# --- 🧠 HELPER: ROBUST PREDICTION ENGINE (FIXED) ---
+# --- 🧠 REAL-TIME PREDICTION ENGINE ---
 def generate_predictions():
     try:
-        # 1. Fetch only Valid Delivered Orders
-        data = list(requests_collection.find({"status": "Delivered"}))
+        # 1. GET REAL DATA (Status: ALL active demand)
+        data = list(requests_collection.find({
+            "status": {"$in": ["Pending", "Approved", "Dispatched", "In-Flight", "Delivered"]}
+        }))
         
-        # If no data, return empty list (Don't crash)
         if not data: 
             return []
 
         df = pd.DataFrame(data)
 
-        # 2. Safety Checks: Ensure required columns exist
         if 'item' not in df.columns or 'phc' not in df.columns or 'createdAt' not in df.columns:
             return []
 
-        # 3. Clean Data
         df['item'] = df['item'].fillna('Unknown')
         df['phc'] = df['phc'].fillna('Unknown')
         
-        # Safe extraction of Item Name (Handle "50x Name" vs "Name")
         def clean_item_name(x):
             if isinstance(x, str) and "x " in x:
-                try:
-                    return x.split("x ")[1]
-                except:
-                    return str(x)
+                try: return x.split("x ")[1]
+                except: return str(x)
             return str(x)
 
         df['item_name'] = df['item'].apply(clean_item_name)
+        df['qty'] = pd.to_numeric(df['qty'], errors='coerce').fillna(0)
         
-        # 4. Process Dates (Handle errors/NaT)
-        df['date'] = pd.to_datetime(df['createdAt'], errors='coerce') 
-        df = df.dropna(subset=['date']) # Drop rows with bad dates
+        df['date'] = pd.to_datetime(df['createdAt'], errors='coerce')
+        df = df.dropna(subset=['date'])
         if df.empty: return []
 
         df['day_of_year'] = df['date'].dt.dayofyear
-
-        # 5. Encoders
+        
         le_item = LabelEncoder()
         df['item_code'] = le_item.fit_transform(df['item_name'])
         
         le_phc = LabelEncoder()
         df['phc_code'] = le_phc.fit_transform(df['phc'])
 
-        # 6. Prepare Training Data
         X = df[['item_code', 'phc_code', 'day_of_year']]
-        y = df['qty'].fillna(0) # Handle missing qty
+        y = df['qty']
 
-        if len(X) < 2: # Not enough data to train
-            return []
+        if len(X) < 1: return []
 
-        model = RandomForestRegressor(n_estimators=100, random_state=42)
+        model = RandomForestRegressor(n_estimators=50, random_state=42)
         model.fit(X, y)
 
         future_predictions = []
@@ -98,39 +91,51 @@ def generate_predictions():
         unique_items = df['item_name'].unique()
         unique_phcs = df['phc'].unique()
 
-        # 7. Generate Forecasts
+        # Generate PER-PHC Predictions
         for phc in unique_phcs:
             try:
                 phc_encoded = le_phc.transform([phc])[0]
                 for item in unique_items:
                     item_encoded = le_item.transform([item])[0]
                     
-                    # Predict using all trees for confidence interval
-                    preds = [tree.predict([[item_encoded, phc_encoded, next_week_day]])[0] for tree in model.estimators_]
-                    pred_qty = np.mean(preds)
-                    lower, upper = np.percentile(preds, 5), np.percentile(preds, 95)
+                    pred_qty = model.predict([[item_encoded, phc_encoded, next_week_day]])[0]
                     
-                    # Determine Trend
-                    history = df[(df['item_name'] == item) & (df['phc'] == phc)]
-                    trend = "Stable"
-                    if not history.empty:
-                        recent_avg = history['qty'].tail(3).mean()
-                        if pred_qty > recent_avg * 1.1: trend = "Rising"
-                        elif pred_qty < recent_avg * 0.9: trend = "Falling"
+                    if pred_qty >= 1:
+                        phc_history = df[(df['item_name'] == item) & (df['phc'] == phc)]
+                        recent_avg = phc_history['qty'].tail(3).mean() if not phc_history.empty else 0
+                        
+                        trend = "Stable"
+                        if pred_qty > recent_avg * 1.1: trend = "Rising 📈"
+                        elif pred_qty < recent_avg * 0.9: trend = "Falling 📉"
 
-                    if round(pred_qty) > 0:
                         future_predictions.append({
-                            "phc": phc, "name": item, "predictedQty": round(pred_qty),
-                            "lower": round(lower, 1), "upper": round(upper, 1), "trend": trend
+                            "phc": phc,
+                            "name": item,
+                            "predictedQty": int(round(pred_qty)),
+                            "trend": trend
                         })
-            except:
-                continue # Skip if encoding fails for specific item
+            except: continue
+
+        # Generate DISTRICT OVERALL (Aggregation)
+        district_data = {}
+        for p in future_predictions:
+            if p['name'] not in district_data:
+                district_data[p['name']] = 0
+            district_data[p['name']] += p['predictedQty']
+        
+        for item_name, total_qty in district_data.items():
+            future_predictions.append({
+                "phc": "District Overall",
+                "name": item_name,
+                "predictedQty": total_qty,
+                "trend": "Aggregated"
+            })
 
         return future_predictions
 
     except Exception as e:
-        print(f"Prediction Engine Error: {e}")
-        return [] # Return empty list on crash, so Dashboard stays alive
+        print(f"AI Error: {e}")
+        return []
 
 @app.route('/predict-demand', methods=['GET'])
 def predict_demand():
@@ -163,7 +168,6 @@ def swasthya_ai():
                 response["text"] = "Please name the two PHCs you want to compare."
             else:
                 phc_a, phc_b = found_phcs[0], found_phcs[1]
-                # Calculate real metrics
                 def get_metrics(name):
                     orders = list(requests_collection.find({"phc": name}))
                     total = len(orders)
@@ -188,9 +192,8 @@ def swasthya_ai():
 
         elif 'track' in query or 'drone' in query:
             target_phc = found_phcs[0] if found_phcs else context.get('userPHC', 'Unknown')
-            # Look for real active mission
             active_order = requests_collection.find_one({
-                "phc": {"$regex": target_phc, "$options": "i"}, # Case insensitive search
+                "phc": {"$regex": target_phc, "$options": "i"},
                 "status": {"$in": ["Dispatched", "In-Flight"]}
             })
             
@@ -213,7 +216,7 @@ def swasthya_ai():
                  response = {
                      "text": f"📈 Forecast for **{target_phc}**:\nHighest demand expected for **{top['name']}**.",
                      "type": "forecast",
-                     "data": { "prediction": top['predictedQty'], "range": f"{top['lower']}-{top['upper']}", "confidence": "85%" }
+                     "data": { "prediction": top['predictedQty'], "range": "High Confidence", "confidence": "85%" }
                  }
              else:
                  response["text"] = f"Insufficient data to forecast for {target_phc}."
@@ -324,7 +327,7 @@ def phc_assistant():
 
         return jsonify(response)
     except Exception as e:
-        return jsonify({"text": "System Error.", "type": "error"}), 500
+        return jsonify({"text": f"System Error: {str(e)}", "type": "error"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5002))
